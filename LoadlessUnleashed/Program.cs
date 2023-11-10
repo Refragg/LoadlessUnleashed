@@ -1,4 +1,6 @@
 ﻿using System.Text;
+using FFMpegCore;
+using FFMpegCore.Enums;
 
 namespace LoadlessUnleashed;
 
@@ -96,11 +98,22 @@ internal class Program
     public const string ShortTimeFormat = @"ss\.fff";
 
     public static readonly StringBuilder sb = new StringBuilder();
+
+    private static bool _encodeVideo = false;
+
+    private static string _videoFile;
+
+    private static string _videoTempFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video-temp");
     
     public static void Main(string[] args)
     {
         if (args.Length == 0)
             Exit("No file provided", 1);
+
+        string? encodeVideoRaw = Environment.GetEnvironmentVariable("LoadlessUnleashed_ENCODE_VIDEO");
+
+        if (encodeVideoRaw is not null && (encodeVideoRaw.ToLower().StartsWith("Y") || encodeVideoRaw.StartsWith("1")))
+            _encodeVideo = true;
 
         string[] rawLines = Array.Empty<string>();
         
@@ -188,6 +201,66 @@ internal class Program
         //Console.WriteLine(output);
         File.WriteAllText("output.txt", output);
         Console.WriteLine("Success! Stats written to 'output.txt'");
+
+        if (!_encodeVideo)
+            return;
+        
+        if (args.Length < 2 || !File.Exists(args[1]))
+            Exit("Asked to encode a new video but the video file is invalid / not provided", 1);
+
+        _videoFile = args[1];
+
+        Directory.CreateDirectory(_videoTempFolder);
+
+        Console.WriteLine("Splitting video file...");
+        
+        TimeSpan splitStartTime = TimeSpan.Zero;
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].Type == LineType.RunStart)
+                continue;
+            
+            if (lines[i].Type == LineType.RunEnd)
+            {
+                SplitVideo(splitStartTime, default, i);
+                break;
+            }
+            
+            SplitVideo(splitStartTime, lines[i].StartTime, i);
+            splitStartTime = lines[i].EndTime;
+        }
+
+        Console.WriteLine("Concatenating the videos...");
+        
+        ConcatenateVideos();
+    }
+
+    public static void SplitVideo(TimeSpan startTime, TimeSpan? endTime, int index)
+    {
+        FFMpegArguments.FromFileInput(_videoFile)
+            .OutputToFile(Path.Combine(_videoTempFolder, index + ".mp4"), true, options =>
+            {
+                options.UsingMultithreading(true).CopyChannel().Seek(startTime);
+            
+                if (endTime is not null)
+                    options.EndSeek(endTime);
+            })
+            .WithLogLevel(FFMpegLogLevel.Info)
+            .ProcessSynchronously();
+    }
+
+    public static void ConcatenateVideos()
+    {
+        IEnumerable<string> files = Directory.EnumerateFiles(_videoTempFolder)
+            .OrderBy(x => int.Parse(new FileInfo(x).Name.Split('.')[0]));
+        
+        FFMpegArguments.FromDemuxConcatInput(files)
+            .OutputToFile("output.mp4", true, options => options
+                .UsingMultithreading(true)
+                .CopyChannel())
+            .WithLogLevel(FFMpegLogLevel.Info)
+            .ProcessSynchronously();
     }
 
     public static void Exit(string message, int exitCode)
