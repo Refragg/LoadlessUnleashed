@@ -101,7 +101,15 @@ internal class Program
 
     private static bool _encodeVideo = false;
 
+    private static bool _doubleEncode = false;
+    
+    private static bool _skipSplitting = false;
+
     private static string _videoFile;
+    
+    private static long _videoBitrate;
+    
+    private static long _audioBitrate;
 
     private static string _videoTempFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "video-temp");
     
@@ -111,9 +119,17 @@ internal class Program
             Exit("No file provided", 1);
 
         string? encodeVideoRaw = Environment.GetEnvironmentVariable("LoadlessUnleashed_ENCODE_VIDEO");
+        string? doubleEncodeVideoRaw = Environment.GetEnvironmentVariable("LoadlessUnleashed_DOUBLE_ENCODE");
+        string? skipSplitting = Environment.GetEnvironmentVariable("LoadlessUnleashed_SKIP_SPLITTING");
 
         if (encodeVideoRaw is not null && (encodeVideoRaw.ToLower().StartsWith("Y") || encodeVideoRaw.StartsWith("1")))
             _encodeVideo = true;
+        
+        if (doubleEncodeVideoRaw is not null && (doubleEncodeVideoRaw.ToLower().StartsWith("Y") || doubleEncodeVideoRaw.StartsWith("1")))
+            _doubleEncode = true;
+        
+        if (skipSplitting is not null && (skipSplitting.ToLower().StartsWith("Y") || skipSplitting.StartsWith("1")))
+            _skipSplitting = true;
 
         string[] rawLines = Array.Empty<string>();
         
@@ -209,57 +225,111 @@ internal class Program
             Exit("Asked to encode a new video but the video file is invalid / not provided", 1);
 
         _videoFile = args[1];
+        
+        IMediaAnalysis videoInfo = FFProbe.Analyse(_videoFile);
+
+        _videoBitrate = videoInfo.PrimaryVideoStream!.BitRate;
+
+        _audioBitrate = videoInfo.PrimaryAudioStream!.BitRate;
 
         Directory.CreateDirectory(_videoTempFolder);
 
-        Console.WriteLine("Splitting video file...");
-        
-        TimeSpan splitStartTime = TimeSpan.Zero;
+        Console.WriteLine("Starting video export, this will take a while");
 
-        for (int i = 0; i < lines.Length; i++)
+        (int left, int top) originalPosition;
+
+        if (!_skipSplitting)
         {
-            if (lines[i].Type == LineType.RunStart)
-                continue;
+            Console.Write("Splitting video file... ");
             
-            if (lines[i].Type == LineType.RunEnd)
+            TimeSpan splitStartTime = TimeSpan.Zero;
+
+            originalPosition = Console.GetCursorPosition();
+            
+            for (int i = 0; i < lines.Length; i++)
             {
-                SplitVideo(splitStartTime, default, i);
-                break;
+                Console.SetCursorPosition(originalPosition.left, originalPosition.top);
+                Console.Write($"{i + 1} / {lines.Length}: ");
+                if (lines[i].Type == LineType.RunStart)
+                    continue;
+                
+                if (lines[i].Type == LineType.RunEnd)
+                {
+                    SplitVideo(splitStartTime, default, i, Console.GetCursorPosition());
+                    break;
+                }
+                
+                SplitVideo(splitStartTime, lines[i].StartTime, i, Console.GetCursorPosition());
+                splitStartTime = lines[i].EndTime;
             }
             
-            SplitVideo(splitStartTime, lines[i].StartTime, i);
-            splitStartTime = lines[i].EndTime;
+            Console.Write(Environment.NewLine);
         }
-
-        Console.WriteLine("Concatenating the videos...");
+        else
+        {
+            Console.WriteLine("Skipping splitting the video");
+        }
         
-        ConcatenateVideos();
+        Console.Write("Outputting video without loads... ");
+        
+        originalPosition = Console.GetCursorPosition();
+        
+        ConcatenateVideos(originalPosition);
+        
+        Console.Write(Environment.NewLine);
     }
 
-    public static void SplitVideo(TimeSpan startTime, TimeSpan? endTime, int index)
+    public static void SplitVideo(TimeSpan startTime, TimeSpan? endTime, int index, (int left, int top) consolePosition)
     {
-        FFMpegArguments.FromFileInput(_videoFile)
+        Console.SetCursorPosition(consolePosition.left, consolePosition.top);
+        Console.Write("starting...");
+        
+        FFMpegArguments.FromFileInput(_videoFile, false, options => options.Seek(startTime))
             .OutputToFile(Path.Combine(_videoTempFolder, index + ".mp4"), true, options =>
             {
-                options.UsingMultithreading(true).CopyChannel().Seek(startTime);
-            
+                options
+                    .UsingMultithreading(true)
+                    .WithFastStart()
+                    .WithVideoBitrate((int)(_videoBitrate / 1000))
+                    .WithAudioBitrate((int)(_audioBitrate / 1000));
+
                 if (endTime is not null)
-                    options.EndSeek(endTime);
+                    options.EndSeek(endTime - startTime);
             })
             .WithLogLevel(FFMpegLogLevel.Info)
+            .NotifyOnProgress((progress) =>
+            {
+                Console.SetCursorPosition(consolePosition.left, consolePosition.top);
+                Console.Write(progress.ToString(TimeFormat) + " encoded");
+            })
             .ProcessSynchronously();
     }
 
-    public static void ConcatenateVideos()
+    public static void ConcatenateVideos((int left, int top) consolePosition)
     {
         IEnumerable<string> files = Directory.EnumerateFiles(_videoTempFolder)
             .OrderBy(x => int.Parse(new FileInfo(x).Name.Split('.')[0]));
         
         FFMpegArguments.FromDemuxConcatInput(files)
-            .OutputToFile("output.mp4", true, options => options
-                .UsingMultithreading(true)
-                .CopyChannel())
+            .OutputToFile("output.mp4", true, options =>
+            {
+                options.UsingMultithreading(true);
+
+                if (_doubleEncode)
+                {
+                    options
+                        .WithVideoBitrate((int)(_videoBitrate / 1000))
+                        .WithAudioBitrate((int)(_audioBitrate / 1000));
+                }
+                else
+                    options.CopyChannel();
+            })
             .WithLogLevel(FFMpegLogLevel.Info)
+            .NotifyOnProgress((progress) =>
+            {
+                Console.SetCursorPosition(consolePosition.left, consolePosition.top);
+                Console.Write(progress.ToString(TimeFormat) + " outputted");
+            })
             .ProcessSynchronously();
     }
 
